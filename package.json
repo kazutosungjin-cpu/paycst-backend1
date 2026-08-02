@@ -1,0 +1,22 @@
+{
+  "name": "paycst-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MySQL + Express backend for PayCST (item #15 — real hashed-credential, parameterized-query storage instead of client-only in-memory state)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "create-admin": "node create-admin.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.10.0"
+  },
+  "allowScripts": {
+    "bcrypt@5.1.1": true
+  }
+}
