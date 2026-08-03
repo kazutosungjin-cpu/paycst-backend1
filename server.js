@@ -97,7 +97,7 @@ app.post('/api/register', async (req, res) => {
 
     await conn.execute(
       'INSERT INTO users (username, password_hash, pin_hash, wallet_id, balance) VALUES (?, ?, ?, ?, ?)',
-      [username, passwordHash, pinHash, walletId, 1000.0]
+      [username, passwordHash, pinHash, walletId, 0.0]
     );
     res.json({ ok: true, walletId });
   } finally {
