@@ -434,24 +434,28 @@ app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, asy
 // same transaction. A single decline closes the loan immediately, no
 // further voting possible.
 //
-// Two things make this closer to a real loan instead of "ask for money":
+// What makes this closer to a real loan instead of "ask for money":
 //
-// 1. ELIGIBILITY GATE — you have to qualify before you're even allowed to
-//    submit an application, the same way a bank checks you before taking
-//    a form:
+// 1. LEGAL / ELIGIBILITY GATE — mirrors what an actual lender checks before
+//    accepting an application at all:
+//      - applicant must self-declare as 18+ (MIN_AGE)
+//      - a government-issued ID number must be provided
+//      - the applicant must explicitly acknowledge the loan terms
 //      - the account must be at least MIN_ACCOUNT_AGE_DAYS old
 //      - no other loan already pending/approved (one active loan at a time)
-//      - the amount can't exceed BALANCE_MULTIPLIER × current balance
-//        (a simple stand-in for an income/means check)
+//      - first-time borrowers are capped at MAX_FIRST_LOAN_AMOUNT — real
+//        lenders don't require you to already have money in the bank to
+//        get a loan, so this is NOT tied to current balance.
 //
 // 2. TIERED APPROVAL — bigger asks need more sign-offs, i.e. it escalates
-//    to more "higher-ups" the larger the loan, via approvalTiersFor().
+//    to more "higher-ups" the larger the loan, via approvalsNeededFor().
 //    The number of approvals a given loan needs is decided ONCE at
 //    application time and stored on the row (loans.approvals_needed), so
 //    it can't drift if the tier thresholds change later.
 
 const MIN_ACCOUNT_AGE_DAYS = 3;
-const BALANCE_MULTIPLIER = 5;
+const MIN_AGE = 18;
+const MAX_FIRST_LOAN_AMOUNT = 10000;
 
 function approvalsNeededFor(amount) {
   if (amount <= 5000) return 1;
@@ -460,14 +464,26 @@ function approvalsNeededFor(amount) {
 }
 
 app.post('/api/loans', requireAuth, async (req, res) => {
-  const { amount, purpose, termMonths } = req.body || {};
+  const { loanType, amount, purpose, termMonths, age, governmentId, legalAck } = req.body || {};
   const amt = Number(amount);
   const term = Number(termMonths);
+  const applicantAge = Number(age);
+
+  if (!loanType || !loanType.toString().trim()) return res.status(400).json({ error: 'A loan platform/type is required' });
   if (!(amt > 0)) return res.status(400).json({ error: 'A positive loan amount is required' });
   if (!purpose || !purpose.toString().trim()) return res.status(400).json({ error: 'A purpose is required' });
   if (!Number.isInteger(term) || term <= 0) return res.status(400).json({ error: 'A valid term (in months) is required' });
+  if (!Number.isInteger(applicantAge) || applicantAge <= 0) return res.status(400).json({ error: 'A valid age is required' });
+  if (applicantAge < MIN_AGE) return res.status(400).json({ error: `You must be at least ${MIN_AGE} years old to apply for a loan` });
+  if (!governmentId || !governmentId.toString().trim()) return res.status(400).json({ error: 'A government-issued ID number is required' });
+  if (!legalAck) return res.status(400).json({ error: 'You must acknowledge the loan terms and conditions to proceed' });
+  if (amt > MAX_FIRST_LOAN_AMOUNT) {
+    return res.status(400).json({
+      error: `First-time borrowers are capped at ₱${MAX_FIRST_LOAN_AMOUNT.toFixed(2)} — try a smaller amount`,
+    });
+  }
 
-  const [[user]] = await pool.query('SELECT balance, created_at FROM users WHERE id = ?', [req.userId]);
+  const [[user]] = await pool.query('SELECT created_at FROM users WHERE id = ?', [req.userId]);
 
   const accountAgeDays = (Date.now() - new Date(user.created_at).getTime()) / (1000 * 60 * 60 * 24);
   if (accountAgeDays < MIN_ACCOUNT_AGE_DAYS) {
@@ -484,24 +500,29 @@ app.post('/api/loans', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'You already have a pending or active loan — repay or resolve it before applying again' });
   }
 
-  const maxEligible = Number(user.balance) * BALANCE_MULTIPLIER;
-  if (amt > maxEligible) {
-    return res.status(400).json({
-      error: `Based on your current balance, you're eligible for up to ₱${maxEligible.toFixed(2)} — try a smaller amount`,
-    });
-  }
-
   const approvalsNeeded = approvalsNeededFor(amt);
   const [result] = await pool.execute(
-    'INSERT INTO loans (user_id, amount, purpose, term_months, approvals_needed) VALUES (?,?,?,?,?)',
-    [req.userId, amt, purpose.toString().trim(), term, approvalsNeeded]
+    `INSERT INTO loans (user_id, loan_type, amount, purpose, term_months, applicant_age, government_id, legal_ack, approvals_needed)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [
+      req.userId,
+      loanType.toString().trim(),
+      amt,
+      purpose.toString().trim(),
+      term,
+      applicantAge,
+      governmentId.toString().trim(),
+      legalAck ? 1 : 0,
+      approvalsNeeded,
+    ]
   );
   res.json({ id: result.insertId, ok: true, approvalsNeeded });
 });
 
 app.get('/api/loans/mine', requireAuth, async (req, res) => {
   const [rows] = await pool.execute(
-    `SELECT l.id, l.amount, l.purpose, l.term_months AS termMonths, l.status,
+    `SELECT l.id, l.loan_type AS loanType, l.amount, l.purpose, l.term_months AS termMonths, l.status,
+            l.applicant_age AS applicantAge, l.government_id AS governmentId,
             l.amount_repaid AS amountRepaid, l.created_at, l.approvals_needed AS approvalsNeeded,
             (SELECT COUNT(*) FROM loan_approvals la WHERE la.loan_id = l.id AND la.decision = 'approve') AS approvalsCount
      FROM loans l WHERE l.user_id = ? ORDER BY l.created_at DESC`,
@@ -569,7 +590,8 @@ app.post('/api/loans/:id/repay', requireAuth, async (req, res) => {
 // buttons instead of letting them try to vote twice and get a 409).
 app.get('/api/admin/loans', requireAdmin, async (req, res) => {
   const [rows] = await pool.execute(
-    `SELECT l.id, l.amount, l.purpose, l.term_months AS termMonths, l.status,
+    `SELECT l.id, l.loan_type AS loanType, l.amount, l.purpose, l.term_months AS termMonths, l.status,
+            l.applicant_age AS applicantAge, l.government_id AS governmentId,
             l.amount_repaid AS amountRepaid, l.created_at, l.approvals_needed AS approvalsNeeded, u.username,
             (SELECT COUNT(*) FROM loan_approvals la WHERE la.loan_id = l.id AND la.decision = 'approve') AS approvalsCount,
             EXISTS(SELECT 1 FROM loan_approvals la WHERE la.loan_id = l.id AND la.admin_id = ?) AS decidedByMe,
