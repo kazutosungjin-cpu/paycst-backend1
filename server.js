@@ -19,6 +19,7 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const pool = require('./db');
 
 const app = express();
@@ -27,6 +28,51 @@ app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const MAX_GROUP_MEMBERS = 6;
+const MAX_CENTAVOS = 100_000_000_00; // ₱100,000,000.00 — sanity ceiling, adjust as you like
+
+// ---------- money handling: integer centavos everywhere (item #1 fix) ----------
+//
+// Every peso amount that touches the database, an API request/response
+// body, or in-process arithmetic is now a plain INTEGER count of centavos
+// (₱1.00 == 100 centavos, so ₱150.50 == 15050). Previously amounts were
+// JS `Number`s backed by MySQL `DECIMAL` columns — both are float-adjacent
+// representations, and repeated add/subtract (payments, contributions,
+// loan repayments) can silently drift a centavo here and there over time,
+// or accept "amounts" like 10.005 that don't correspond to real money.
+// Integers don't have that failure mode.
+//
+// CLIENT CONTRACT CHANGE: the Flutter app must send and expect every
+// amount field as an integer number of centavos, not a decimal like
+// 150.50 — send 15050 instead, and divide by 100 only when *displaying*
+// a value to the user. See the migration note at the bottom of this file
+// for the required DB column changes (DECIMAL -> INT).
+
+// Validates an amount coming FROM a client request. Only accepts a
+// strictly positive integer (fractional centavos aren't a real unit).
+// Returns null (not a thrown error) on anything invalid so callers can
+// respond with a normal 400.
+function parseCentavos(value) {
+  const n = typeof value === 'string' ? Number(value) : value;
+  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+  if (!Number.isInteger(n)) return null;
+  if (n <= 0) return null;
+  if (n > MAX_CENTAVOS) return null;
+  return n;
+}
+
+// Normalizes a value coming FROM the database. mysql2 returns some large
+// integer column types as strings rather than JS numbers, so every stored
+// balance/amount is passed through this before arithmetic or comparisons.
+function toCentavos(dbValue) {
+  const n = typeof dbValue === 'string' ? parseInt(dbValue, 10) : dbValue;
+  return Number.isSafeInteger(n) ? n : 0;
+}
+
+// Only for building human-readable error/display strings — never for
+// storage or arithmetic.
+function centavosToPesosLabel(centavos) {
+  return (centavos / 100).toFixed(2);
+}
 
 function sign(payload, expiresIn) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn });
@@ -95,9 +141,10 @@ app.post('/api/register', async (req, res) => {
       walletId = nextWalletId();
     }
 
+    // Starting balance is 0 centavos (integer), not 0.0.
     await conn.execute(
       'INSERT INTO users (username, password_hash, pin_hash, wallet_id, balance) VALUES (?, ?, ?, ?, ?)',
-      [username, passwordHash, pinHash, walletId, 0.0]
+      [username, passwordHash, pinHash, walletId, 0]
     );
     res.json({ ok: true, walletId });
   } finally {
@@ -140,22 +187,27 @@ app.post('/api/login/verify-pin', async (req, res) => {
   const token = sign({ uid: user.id, stage: 'full', role: 'user' }, '12h');
   res.json({
     token,
-    user: { id: user.id, username: user.username, walletId: user.wallet_id, balance: user.balance },
+    // balance is returned as an integer count of centavos — the client
+    // divides by 100 only when displaying it.
+    user: { id: user.id, username: user.username, walletId: user.wallet_id, balance: toCentavos(user.balance) },
   });
 });
 
 app.get('/api/me', requireAuth, async (req, res) => {
   const [rows] = await pool.execute('SELECT id, username, wallet_id, balance FROM users WHERE id = ?', [req.userId]);
   if (!rows[0]) return res.status(404).json({ error: 'User not found' });
-  res.json(rows[0]);
+  const u = rows[0];
+  res.json({ id: u.id, username: u.username, wallet_id: u.wallet_id, balance: toCentavos(u.balance) });
 });
 
 // ---------- wallet-to-wallet (QR) payment ----------
 
 app.post('/api/wallet/pay', requireAuth, async (req, res) => {
-  const { walletId, amount } = req.body || {};
-  const amt = Number(amount);
-  if (!walletId || !(amt > 0)) return res.status(400).json({ error: 'walletId and a positive amount are required' });
+  const { walletId, amountCentavos } = req.body || {};
+  const amt = parseCentavos(amountCentavos);
+  if (!walletId || amt === null) {
+    return res.status(400).json({ error: 'walletId and a positive amount (integer centavos) are required' });
+  }
 
   const conn = await pool.getConnection();
   try {
@@ -174,20 +226,288 @@ app.post('/api/wallet/pay', requireAuth, async (req, res) => {
       await conn.rollback();
       return res.status(400).json({ error: "You can't pay your own Wallet ID" });
     }
-    if (Number(sender.balance) < amt) {
+
+    const senderBalance = toCentavos(sender.balance);
+    if (senderBalance < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
+    const transferRef = crypto.randomUUID();
     await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, sender.id]);
     await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, recipient.id]);
     await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref) VALUES (?,?,?,?,?,?,?)',
+      ['user', sender.id, `QR Payment to ${recipient.username}`, 'QR Payment', amt, 0, transferRef]
+    );
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref) VALUES (?,?,?,?,?,?,?)',
+      ['user', recipient.id, `QR Payment from user #${sender.id}`, 'QR Payment', amt, 1, transferRef]
+    );
+
+    await conn.commit();
+    res.json({ ok: true });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+// ---------- personal-account actions (restored) ----------
+
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  const [rows] = await pool.execute(
+    `SELECT id, label AS title, type, amount, is_credit AS isCredit, created_at AS createdAt
+     FROM transactions
+     WHERE account_type = 'user' AND account_id = ?
+     ORDER BY created_at DESC
+     LIMIT 20`,
+    [req.userId]
+  );
+  res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
+});
+
+app.post('/api/send', requireAuth, async (req, res) => {
+  const recipient = req.body?.recipient?.toString().trim();
+  const amt = parseCentavos(req.body?.amountCentavos);
+  if (!recipient || amt === null) {
+    return res.status(400).json({ error: 'recipient and a positive amount (integer centavos) are required' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[sender]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const [[recipientUser]] = await conn.query('SELECT id, username, balance FROM users WHERE wallet_id = ? FOR UPDATE', [
+      recipient,
+    ]);
+
+    if (!recipientUser) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'No account found for that Wallet ID' });
+    }
+    if (recipientUser.id === sender.id) {
+      await conn.rollback();
+      return res.status(400).json({ error: "You can't send money to your own Wallet ID" });
+    }
+
+    const senderBalance = toCentavos(sender.balance);
+    if (senderBalance < amt) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    const transferRef = crypto.randomUUID();
+    await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, sender.id]);
+    await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, recipientUser.id]);
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref) VALUES (?,?,?,?,?,?,?)',
+      ['user', sender.id, `Sent to ${recipientUser.username}`, 'Send Money', amt, 0, transferRef]
+    );
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref) VALUES (?,?,?,?,?,?,?)',
+      ['user', recipientUser.id, `Received from user #${sender.id}`, 'Send Money', amt, 1, transferRef]
+    );
+
+    await conn.commit();
+    res.json({ ok: true });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+app.post('/api/load', requireAuth, async (req, res) => {
+  const { number, network } = req.body || {};
+  const amt = parseCentavos(req.body?.amountCentavos);
+  if (!number || !network || amt === null) {
+    return res.status(400).json({ error: 'number, network, and a positive amount (integer centavos) are required' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[user]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const userBalance = toCentavos(user.balance);
+    if (userBalance < amt) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, req.userId]);
+    await conn.execute(
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
-      ['user', sender.id, `QR Payment to ${recipient.username}`, 'QR Payment', amt, 0]
+      ['user', req.userId, `Mobile Load to ${number}`, 'Load', amt, 0]
+    );
+
+    await conn.commit();
+    res.json({ ok: true });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+app.post('/api/bills/pay', requireAuth, async (req, res) => {
+  const biller = req.body?.biller?.toString().trim();
+  const amt = parseCentavos(req.body?.amountCentavos);
+  if (!biller || amt === null) {
+    return res.status(400).json({ error: 'biller and a positive amount (integer centavos) are required' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[user]] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const userBalance = toCentavos(user.balance);
+    if (userBalance < amt) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, req.userId]);
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
+      ['user', req.userId, `Bill Pay to ${biller}`, 'Bill Payment', amt, 0]
+    );
+
+    await conn.commit();
+    res.json({ ok: true });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+app.get('/api/transactions', requireAuth, async (req, res) => {
+  const [[me]] = await pool.query('SELECT username FROM users WHERE id = ?', [req.userId]);
+  const [groupRows] = await pool.execute(
+    'SELECT g.id, g.name FROM group_members gm JOIN `groups` g ON g.id = gm.group_id WHERE gm.user_id = ?',
+    [req.userId]
+  );
+  const groupNameById = Object.fromEntries(groupRows.map((g) => [g.id, g.name]));
+  const groupIds = groupRows.map((g) => g.id);
+
+  let rows;
+  if (groupIds.length > 0) {
+    const placeholders = groupIds.map(() => '?').join(',');
+    const [result] = await pool.query(
+      `SELECT id, account_type, account_id, label, type, amount, is_credit AS isCredit, created_at AS createdAt
+       FROM transactions
+       WHERE (account_type = 'user' AND account_id = ?)
+          OR (account_type = 'group' AND account_id IN (${placeholders}))
+       ORDER BY created_at DESC`,
+      [req.userId, ...groupIds]
+    );
+    rows = result;
+  } else {
+    const [result] = await pool.execute(
+      `SELECT id, account_type, account_id, label, type, amount, is_credit AS isCredit, created_at AS createdAt
+       FROM transactions WHERE account_type = 'user' AND account_id = ? ORDER BY created_at DESC`,
+      [req.userId]
+    );
+    rows = result;
+  }
+
+  res.json(
+    rows.map((row) => ({
+      ...row,
+      amount: toCentavos(row.amount),
+      accountName: row.account_type === 'user' ? me.username : groupNameById[row.account_id] || 'Group',
+    }))
+  );
+});
+
+app.get('/api/groups', requireAuth, async (req, res) => {
+  const [rows] = await pool.execute(
+    `SELECT g.id, g.name, g.balance,
+            (SELECT COUNT(*) FROM group_members gm2 WHERE gm2.group_id = g.id) AS memberCount
+     FROM \`groups\` g
+     ORDER BY g.name ASC`
+  );
+  res.json(rows.map((g) => ({ ...g, balance: toCentavos(g.balance) })));
+});
+
+app.get('/api/groups/:id', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const [[group]] = await pool.query('SELECT id, name, balance FROM `groups` WHERE id = ?', [groupId]);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+
+  const [members] = await pool.execute(
+    `SELECT u.id, u.username, u.wallet_id AS walletId
+     FROM group_members gm JOIN users u ON u.id = gm.user_id
+     WHERE gm.group_id = ?`,
+    [groupId]
+  );
+
+  res.json({ id: group.id, name: group.name, balance: toCentavos(group.balance), members });
+});
+
+app.get('/api/groups/:id/transactions', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const [rows] = await pool.execute(
+    `SELECT id, label, type, amount, is_credit AS isCredit, created_at AS createdAt
+     FROM transactions
+     WHERE account_type = 'group' AND account_id = ?
+     ORDER BY created_at DESC`,
+    [groupId]
+  );
+  res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
+});
+
+app.get('/api/groups/:id/requests', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const [rows] = await pool.execute(
+    `SELECT id, requester_name AS requesterName, reason, amount, status, created_at AS createdAt
+     FROM withdrawal_requests
+     WHERE group_id = ?
+     ORDER BY created_at DESC`,
+    [groupId]
+  );
+  res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
+});
+
+app.post('/api/groups/:id/withdraw', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const amt = parseCentavos(req.body?.amountCentavos);
+  if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[membership]] = await conn.query('SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?', [
+      groupId,
+      req.userId,
+    ]);
+    if (!membership) {
+      await conn.rollback();
+      return res.status(403).json({ error: 'Not a member of this group' });
+    }
+
+    const [[group]] = await conn.query('SELECT balance FROM `groups` WHERE id = ? FOR UPDATE', [groupId]);
+    const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    if (toCentavos(group.balance) < amt) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Insufficient group balance' });
+    }
+
+    await conn.execute('UPDATE `groups` SET balance = balance - ? WHERE id = ?', [amt, groupId]);
+    await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, req.userId]);
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
+      ['group', groupId, `Withdrawal to user #${req.userId}`, 'Group Withdrawal', amt, 0]
     );
     await conn.execute(
       'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
-      ['user', recipient.id, `QR Payment from user #${sender.id}`, 'QR Payment', amt, 1]
+      ['user', req.userId, `Group withdrawal from #${groupId}`, 'Group Withdrawal', amt, 1]
     );
 
     await conn.commit();
@@ -260,13 +580,13 @@ app.get('/api/groups/mine', requireAuth, async (req, res) => {
      WHERE gm.user_id = ?`,
     [req.userId]
   );
-  res.json(rows);
+  res.json(rows.map((g) => ({ ...g, balance: toCentavos(g.balance) })));
 });
 
 app.post('/api/groups/:id/contribute', requireAuth, async (req, res) => {
   const groupId = Number(req.params.id);
-  const amt = Number(req.body?.amount);
-  if (!(amt > 0)) return res.status(400).json({ error: 'A positive amount is required' });
+  const amt = parseCentavos(req.body?.amountCentavos);
+  if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
 
   const conn = await pool.getConnection();
   try {
@@ -280,7 +600,7 @@ app.post('/api/groups/:id/contribute', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Not a member of this group' });
     }
     const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
-    if (Number(user.balance) < amt) {
+    if (toCentavos(user.balance) < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
     }
@@ -302,10 +622,10 @@ app.post('/api/groups/:id/contribute', requireAuth, async (req, res) => {
 
 app.post('/api/groups/:id/requests', requireAuth, async (req, res) => {
   const groupId = Number(req.params.id);
-  const { requesterName, reason, amount } = req.body || {};
-  const amt = Number(amount);
-  if (!requesterName || !reason || !(amt > 0)) {
-    return res.status(400).json({ error: 'requesterName, reason, and a positive amount are required' });
+  const { requesterName, reason, amountCentavos } = req.body || {};
+  const amt = parseCentavos(amountCentavos);
+  if (!requesterName || !reason || amt === null) {
+    return res.status(400).json({ error: 'requesterName, reason, and a positive amount (integer centavos) are required' });
   }
   await pool.execute(
     'INSERT INTO withdrawal_requests (group_id, requester_name, reason, amount) VALUES (?,?,?,?)',
@@ -334,13 +654,14 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
             (SELECT COUNT(*) FROM group_members gm WHERE gm.user_id = u.id) AS groupCount
      FROM users u ORDER BY u.created_at DESC`
   );
-  res.json(users);
+  res.json(users.map((u) => ({ ...u, balance: toCentavos(u.balance) })));
 });
 
 // Full oversight view: every group with its members and pending requests.
 app.get('/api/admin/groups', requireAdmin, async (req, res) => {
   const [groups] = await pool.query('SELECT id, name, balance FROM `groups`');
   for (const g of groups) {
+    g.balance = toCentavos(g.balance);
     const [members] = await pool.execute(
       `SELECT u.id, u.username, u.wallet_id AS walletId
        FROM group_members gm JOIN users u ON u.id = gm.user_id
@@ -353,7 +674,7 @@ app.get('/api/admin/groups', requireAdmin, async (req, res) => {
       [g.id]
     );
     g.members = members;
-    g.pendingRequests = requests;
+    g.pendingRequests = requests.map((r) => ({ ...r, amount: toCentavos(r.amount) }));
   }
   res.json(groups);
 });
@@ -387,14 +708,15 @@ app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, asy
       await conn.rollback();
       return res.status(404).json({ error: 'Request not found or already decided' });
     }
+    const requestAmount = toCentavos(request.amount);
 
     if (approve) {
       const [[group]] = await conn.query('SELECT balance FROM `groups` WHERE id = ? FOR UPDATE', [groupId]);
-      if (Number(group.balance) < Number(request.amount)) {
+      if (toCentavos(group.balance) < requestAmount) {
         await conn.rollback();
         return res.status(400).json({ error: 'Not enough funds in the group to approve this request' });
       }
-      await conn.execute('UPDATE `groups` SET balance = balance - ? WHERE id = ?', [request.amount, groupId]);
+      await conn.execute('UPDATE `groups` SET balance = balance - ? WHERE id = ?', [requestAmount, groupId]);
       await conn.execute(
         'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, details) VALUES (?,?,?,?,?,?,?)',
         [
@@ -402,7 +724,7 @@ app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, asy
           groupId,
           `Sent to ${request.requester_name} (Support)`,
           'Withdrawal',
-          request.amount,
+          requestAmount,
           0,
           JSON.stringify({ reason: request.reason }),
         ]
@@ -416,6 +738,67 @@ app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, asy
 
     await conn.commit();
     res.json({ ok: true, status: approve ? 'approved' : 'declined' });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+// ---------- admin transfer reversal ----------
+
+app.get('/api/admin/transfers/:transferRef', requireAdmin, async (req, res) => {
+  const transferRef = req.params.transferRef;
+  const [rows] = await pool.execute(
+    `SELECT id, account_type AS accountType, account_id AS accountId, label, type, amount, is_credit AS isCredit, transfer_ref AS transferRef, created_at AS createdAt
+     FROM transactions
+     WHERE transfer_ref = ?
+     ORDER BY created_at ASC`,
+    [transferRef]
+  );
+
+  if (rows.length === 0) {
+    return res.status(404).json({ error: 'Transfer not found' });
+  }
+
+  res.json({ transferRef, entries: rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })) });
+});
+
+app.post('/api/admin/transfers/:transferRef/reverse', requireAdmin, async (req, res) => {
+  const transferRef = req.params.transferRef;
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [rows] = await conn.query(
+      'SELECT id, account_type, account_id, label, type, amount, is_credit FROM transactions WHERE transfer_ref = ? FOR UPDATE',
+      [transferRef]
+    );
+
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Transfer not found' });
+    }
+
+    const reversalTransferRef = crypto.randomUUID();
+
+    for (const row of rows) {
+      const amount = toCentavos(row.amount);
+      const reversalIsCredit = row.is_credit ? 0 : 1;
+      const balanceDelta = row.is_credit ? -amount : amount;
+
+      if (row.account_type === 'user') {
+        await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [balanceDelta, row.account_id]);
+      }
+
+      await conn.execute(
+        'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, transfer_ref, reversed_transfer_ref) VALUES (?,?,?,?,?,?,?,?)',
+        ['user', row.account_id, `Reversal: ${row.label}`, row.type || 'Transfer Reversal', amount, reversalIsCredit, reversalTransferRef, transferRef]
+      );
+    }
+
+    await conn.commit();
+    res.json({ ok: true, transferRef });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -443,9 +826,9 @@ app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, asy
 //      - the applicant must explicitly acknowledge the loan terms
 //      - the account must be at least MIN_ACCOUNT_AGE_DAYS old
 //      - no other loan already pending/approved (one active loan at a time)
-//      - first-time borrowers are capped at MAX_FIRST_LOAN_AMOUNT — real
-//        lenders don't require you to already have money in the bank to
-//        get a loan, so this is NOT tied to current balance.
+//      - first-time borrowers are capped at MAX_FIRST_LOAN_AMOUNT_CENTAVOS —
+//        real lenders don't require you to already have money in the bank
+//        to get a loan, so this is NOT tied to current balance.
 //
 // 2. TIERED APPROVAL — bigger asks need more sign-offs, i.e. it escalates
 //    to more "higher-ups" the larger the loan, via approvalsNeededFor().
@@ -455,31 +838,33 @@ app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, asy
 
 const MIN_ACCOUNT_AGE_DAYS = 3;
 const MIN_AGE = 18;
-const MAX_FIRST_LOAN_AMOUNT = 10000;
+const MAX_FIRST_LOAN_AMOUNT_CENTAVOS = 1_000_000; // ₱10,000.00
+const LOAN_TIER_1_CENTAVOS = 500_000; // ₱5,000.00
+const LOAN_TIER_2_CENTAVOS = 2_000_000; // ₱20,000.00
 
-function approvalsNeededFor(amount) {
-  if (amount <= 5000) return 1;
-  if (amount <= 20000) return 2;
+function approvalsNeededFor(amountCentavos) {
+  if (amountCentavos <= LOAN_TIER_1_CENTAVOS) return 1;
+  if (amountCentavos <= LOAN_TIER_2_CENTAVOS) return 2;
   return 3;
 }
 
 app.post('/api/loans', requireAuth, async (req, res) => {
-  const { loanType, amount, purpose, termMonths, age, governmentId, legalAck } = req.body || {};
-  const amt = Number(amount);
+  const { loanType, amountCentavos, purpose, termMonths, age, governmentId, legalAck } = req.body || {};
+  const amt = parseCentavos(amountCentavos);
   const term = Number(termMonths);
   const applicantAge = Number(age);
 
   if (!loanType || !loanType.toString().trim()) return res.status(400).json({ error: 'A loan platform/type is required' });
-  if (!(amt > 0)) return res.status(400).json({ error: 'A positive loan amount is required' });
+  if (amt === null) return res.status(400).json({ error: 'A positive loan amount (integer centavos) is required' });
   if (!purpose || !purpose.toString().trim()) return res.status(400).json({ error: 'A purpose is required' });
   if (!Number.isInteger(term) || term <= 0) return res.status(400).json({ error: 'A valid term (in months) is required' });
   if (!Number.isInteger(applicantAge) || applicantAge <= 0) return res.status(400).json({ error: 'A valid age is required' });
   if (applicantAge < MIN_AGE) return res.status(400).json({ error: `You must be at least ${MIN_AGE} years old to apply for a loan` });
   if (!governmentId || !governmentId.toString().trim()) return res.status(400).json({ error: 'A government-issued ID number is required' });
   if (!legalAck) return res.status(400).json({ error: 'You must acknowledge the loan terms and conditions to proceed' });
-  if (amt > MAX_FIRST_LOAN_AMOUNT) {
+  if (amt > MAX_FIRST_LOAN_AMOUNT_CENTAVOS) {
     return res.status(400).json({
-      error: `First-time borrowers are capped at ₱${MAX_FIRST_LOAN_AMOUNT.toFixed(2)} — try a smaller amount`,
+      error: `First-time borrowers are capped at ₱${centavosToPesosLabel(MAX_FIRST_LOAN_AMOUNT_CENTAVOS)} — try a smaller amount`,
     });
   }
 
@@ -528,13 +913,13 @@ app.get('/api/loans/mine', requireAuth, async (req, res) => {
      FROM loans l WHERE l.user_id = ? ORDER BY l.created_at DESC`,
     [req.userId]
   );
-  res.json(rows);
+  res.json(rows.map((l) => ({ ...l, amount: toCentavos(l.amount), amountRepaid: toCentavos(l.amountRepaid) })));
 });
 
 app.post('/api/loans/:id/repay', requireAuth, async (req, res) => {
   const loanId = Number(req.params.id);
-  const amt = Number(req.body?.amount);
-  if (!(amt > 0)) return res.status(400).json({ error: 'A positive repayment amount is required' });
+  const amt = parseCentavos(req.body?.amountCentavos);
+  if (amt === null) return res.status(400).json({ error: 'A positive repayment amount (integer centavos) is required' });
 
   const conn = await pool.getConnection();
   try {
@@ -554,15 +939,17 @@ app.post('/api/loans/:id/repay', requireAuth, async (req, res) => {
     }
 
     const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
-    if (Number(user.balance) < amt) {
+    if (toCentavos(user.balance) < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
-    const remaining = Number(loan.amount) - Number(loan.amount_repaid);
+    const loanAmount = toCentavos(loan.amount);
+    const loanRepaid = toCentavos(loan.amount_repaid);
+    const remaining = loanAmount - loanRepaid;
     const applied = Math.min(amt, remaining);
-    const newRepaid = Number(loan.amount_repaid) + applied;
-    const nowRepaid = newRepaid >= Number(loan.amount);
+    const newRepaid = loanRepaid + applied;
+    const nowRepaid = newRepaid >= loanAmount;
 
     await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [applied, req.userId]);
     await conn.execute('UPDATE loans SET amount_repaid = ?, status = ? WHERE id = ?', [
@@ -576,7 +963,7 @@ app.post('/api/loans/:id/repay', requireAuth, async (req, res) => {
     );
 
     await conn.commit();
-    res.json({ ok: true, remaining: Number(loan.amount) - newRepaid });
+    res.json({ ok: true, remaining: loanAmount - newRepaid });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -600,7 +987,7 @@ app.get('/api/admin/loans', requireAdmin, async (req, res) => {
      ORDER BY (l.status = 'pending') DESC, l.created_at DESC`,
     [req.adminId, req.adminId]
   );
-  res.json(rows);
+  res.json(rows.map((l) => ({ ...l, amount: toCentavos(l.amount), amountRepaid: toCentavos(l.amountRepaid) })));
 });
 
 app.post('/api/admin/loans/:id/respond', requireAdmin, async (req, res) => {
@@ -648,10 +1035,11 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, async (req, res) => {
     );
 
     if (approvals >= loan.approvals_needed) {
+      const loanAmount = toCentavos(loan.amount);
       // Fully verified — disburse now, in the same transaction as the
       // status flip, so a loan can never be marked approved without the
       // funds actually landing (or vice versa).
-      await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [loan.amount, loan.user_id]);
+      await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [loanAmount, loan.user_id]);
       await conn.execute("UPDATE loans SET status = 'approved', decided_at = NOW() WHERE id = ?", [loanId]);
       await conn.execute(
         'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit, details) VALUES (?,?,?,?,?,?,?)',
@@ -660,7 +1048,7 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, async (req, res) => {
           loan.user_id,
           `Loan Disbursed (${loan.term_months}-month term)`,
           'Loan Disbursement',
-          loan.amount,
+          loanAmount,
           1,
           JSON.stringify({ purpose: loan.purpose }),
         ]
@@ -686,3 +1074,37 @@ app.use((err, req, res, next) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`PayCST backend listening on port ${port}`));
+
+// ---------- DB MIGRATION REQUIRED (item #1) ----------
+//
+// This file now writes/reads money as INTEGER centavos, but the columns
+// below were presumably created as DECIMAL(x,2) storing pesos. Run this
+// migration (adjust table/column names if yours differ) BEFORE deploying
+// this file, and multiply any existing data by 100 as part of it:
+//
+//   ALTER TABLE users
+//     MODIFY balance INT NOT NULL DEFAULT 0;
+//   UPDATE users SET balance = ROUND(balance * 100);
+//
+//   ALTER TABLE transactions
+//     MODIFY amount INT NOT NULL;
+//   UPDATE transactions SET amount = ROUND(amount * 100);
+//
+//   ALTER TABLE `groups`
+//     MODIFY balance INT NOT NULL DEFAULT 0;
+//   UPDATE `groups` SET balance = ROUND(balance * 100);
+//
+//   ALTER TABLE withdrawal_requests
+//     MODIFY amount INT NOT NULL;
+//   UPDATE withdrawal_requests SET amount = ROUND(amount * 100);
+//
+//   ALTER TABLE loans
+//     MODIFY amount INT NOT NULL,
+//     MODIFY amount_repaid INT NOT NULL DEFAULT 0;
+//   UPDATE loans SET amount = ROUND(amount * 100), amount_repaid = ROUND(amount_repaid * 100);
+//
+// IMPORTANT: run the ALTER (column type change) and the UPDATE (x100) as
+// one deploy step, with the app briefly stopped, so no write lands between
+// the two using the "wrong" unit. INT tops out around ₱21.4 million per
+// row (2^31 centavos) — swap to BIGINT above if you need headroom beyond
+// that for group or admin-aggregate balances.

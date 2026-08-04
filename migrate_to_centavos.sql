@@ -1,17 +1,5 @@
 -- PayCST: migrate money columns from DECIMAL pesos to INTEGER centavos
 -- Run with: mysql -u root -p paycst < migrate_to_centavos.sql
---
--- IMPORTANT — do this in order:
---   1. STOP the server (server.js should not be running).
---   2. BACK UP first:
---        mysqldump -u root -p paycst > backup_before_centavos_migration.sql
---   3. Run this script.
---   4. Verify the numbers below look right (see check queries at the bottom).
---   5. Restart the server.
---
--- Each ALTER + UPDATE pair changes the column type AND multiplies existing
--- data by 100 in the same step, so no row is ever left ambiguous about
--- which unit it's in.
 
 USE paycst;
 
@@ -38,10 +26,7 @@ ALTER TABLE loans
   MODIFY amount_repaid INT NOT NULL DEFAULT 0;
 UPDATE loans SET amount = ROUND(amount * 100), amount_repaid = ROUND(amount_repaid * 100);
 
--- ---------- verification ----------
--- After running, check these against what you expect (e.g. a user who had
--- a balance of 150.50 pesos should now show 15050):
-
+-- verification queries
 SELECT id, username, balance FROM users LIMIT 10;
 SELECT id, name, balance FROM `groups` LIMIT 10;
 SELECT id, amount FROM transactions ORDER BY id DESC LIMIT 10;
