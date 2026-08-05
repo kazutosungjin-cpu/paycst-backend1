@@ -75,6 +75,13 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const pool = require('./db');
 const { PROVIDERS, findCheapestRoute } = require('./graph');
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (server stayed up):', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (server stayed up):', err);
+});
 
 const app = express();
 app.use(cors());
@@ -578,21 +585,25 @@ app.get('/api/groups', requireAuth, async (req, res) => {
 
 app.get('/api/groups/:id', requireAuth, async (req, res) => {
   const groupId = Number(req.params.id);
+  if (!Number.isInteger(groupId)) {
+    return res.status(400).json({ error: 'Invalid group ID' });
+  }
   const [[group]] = await pool.query('SELECT id, name, balance FROM `groups` WHERE id = ?', [groupId]);
   if (!group) return res.status(404).json({ error: 'Group not found' });
-
   const [members] = await pool.execute(
     `SELECT u.id, u.username, u.wallet_id AS walletId
      FROM group_members gm JOIN users u ON u.id = gm.user_id
      WHERE gm.group_id = ?`,
     [groupId]
   );
-
   res.json({ id: group.id, name: group.name, balance: toCentavos(group.balance), members });
 });
 
 app.get('/api/groups/:id/transactions', requireAuth, async (req, res) => {
   const groupId = Number(req.params.id);
+  if (!Number.isInteger(groupId)) {
+    return res.status(400).json({ error: 'Invalid group ID' });
+  }
   const [rows] = await pool.execute(
     `SELECT id, label, type, amount, is_credit AS isCredit, created_at AS createdAt
      FROM transactions
