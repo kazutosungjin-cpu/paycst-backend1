@@ -573,6 +573,18 @@ app.get('/api/transactions', requireAuth, async (req, res) => {
   res.json(sorted);
 });
 
+app.get('/api/groups/mine', requireAuth, async (req, res) => {
+  const [rows] = await pool.execute(
+    `SELECT g.id, g.name, g.balance,
+            (SELECT COUNT(*) FROM group_members gm2 WHERE gm2.group_id = g.id) AS memberCount
+     FROM \`groups\` g
+     JOIN group_members gm ON gm.group_id = g.id
+     WHERE gm.user_id = ?`,
+    [req.userId]
+  );
+  res.json(rows.map((g) => ({ ...g, balance: toCentavos(g.balance) })));
+});
+
 app.get('/api/groups', requireAuth, async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT g.id, g.name, g.balance,
@@ -727,17 +739,6 @@ app.post('/api/groups/:id/join', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/api/groups/mine', requireAuth, async (req, res) => {
-  const [rows] = await pool.execute(
-    `SELECT g.id, g.name, g.balance,
-            (SELECT COUNT(*) FROM group_members gm2 WHERE gm2.group_id = g.id) AS memberCount
-     FROM \`groups\` g
-     JOIN group_members gm ON gm.group_id = g.id
-     WHERE gm.user_id = ?`,
-    [req.userId]
-  );
-  res.json(rows.map((g) => ({ ...g, balance: toCentavos(g.balance) })));
-});
 
 app.post('/api/groups/:id/contribute', requireAuth, async (req, res) => {
   const groupId = Number(req.params.id);
