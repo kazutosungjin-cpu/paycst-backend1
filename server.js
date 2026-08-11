@@ -225,12 +225,15 @@ function nextWalletId() {
 // ---------- registration / login (password, THEN pin) ----------
 
 app.post('/api/register', async (req, res) => {
-  const { username, password, pin } = req.body || {};
-  if (!username || !password || !pin) {
-    return res.status(400).json({ error: 'username, password, and pin are required' });
+  const { username, password, pin, phoneNumber } = req.body || {};
+  if (!username || !password || !pin || !phoneNumber) {
+    return res.status(400).json({ error: 'username, password, pin, and phoneNumber are required' });
   }
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
   if (!/^\d{4}$/.test(pin)) return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+  if (!/^09\d{9}$/.test(phoneNumber)) {
+    return res.status(400).json({ error: 'Phone number must be 11 digits starting with 09 (e.g. 09171234567)' });
+  }
 
   const conn = await pool.getConnection();
   try {
@@ -254,8 +257,8 @@ app.post('/api/register', async (req, res) => {
     }
 
     const [result] = await conn.execute(
-      'INSERT INTO users (username, password_hash, pin_hash, wallet_id, balance) VALUES (?, ?, ?, ?, ?)',
-      [username, passwordHash, pinHash, walletId, 0]
+      'INSERT INTO users (username, password_hash, pin_hash, wallet_id, balance, phone_number) VALUES (?, ?, ?, ?, ?, ?)',
+      [username, passwordHash, pinHash, walletId, 0, phoneNumber]
     );
 
     // Row is committed to MySQL — now safe to add it to the index.
