@@ -194,6 +194,13 @@ function verify(token) {
   }
 }
 
+// ADD IT RIGHT HERE:
+function asyncRoute(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
 // Requires a FULL session token (password + PIN both verified).
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
@@ -641,48 +648,41 @@ app.get('/api/groups/:id/requests', requireAuth, async (req, res) => {
   res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
 });
 
-app.post('/api/groups/:id/withdraw', requireAuth, async (req, res) => {
+app.post('/api/groups/:id/withdraw-requests', requireAuth, async (req, res) => {
   const groupId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
+  const reason = req.body?.reason?.toString().trim() || null;
   if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const [[membership]] = await conn.query('SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?', [
-      groupId,
-      req.userId,
-    ]);
-    if (!membership) {
+
+    const [members] = await conn.query(
+      'SELECT user_id FROM group_members WHERE group_id = ?',
+      [groupId]
+    );
+    if (!members.some((m) => m.user_id === req.userId)) {
       await conn.rollback();
       return res.status(403).json({ error: 'Not a member of this group' });
     }
 
-    const [[group]] = await conn.query('SELECT balance FROM `groups` WHERE id = ? FOR UPDATE', [groupId]);
-    const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    const [[group]] = await conn.query('SELECT balance FROM `groups` WHERE id = ?', [groupId]);
     if (toCentavos(group.balance) < amt) {
       await conn.rollback();
       return res.status(400).json({ error: 'Insufficient group balance' });
     }
 
-    await conn.execute('UPDATE `groups` SET balance = balance - ? WHERE id = ?', [amt, groupId]);
-    await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, req.userId]);
-    await conn.execute(
-      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
-      ['group', groupId, `Withdrawal to user #${req.userId}`, 'Group Withdrawal', amt, 0]
-    );
-    await conn.execute(
-      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
-      ['user', req.userId, `Group withdrawal from #${groupId}`, 'Group Withdrawal', amt, 1]
+    // majority = more than half of current members
+    const approvalsNeeded = Math.floor(members.length / 2) + 1;
+
+    const [result] = await conn.execute(
+      'INSERT INTO group_withdraw_requests (group_id, requester_id, amount, reason, approvals_needed) VALUES (?,?,?,?,?)',
+      [groupId, req.userId, amt, reason, approvalsNeeded]
     );
 
     await conn.commit();
-
-    // Row is committed — refresh so the index doesn't serve a stale
-    // balance (item #6 fix).
-    await refreshUserInIndex(req.userId);
-
-    res.json({ ok: true });
+    res.json({ id: result.insertId, ok: true, approvalsNeeded });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -691,6 +691,27 @@ app.post('/api/groups/:id/withdraw', requireAuth, async (req, res) => {
   }
 });
 
+app.get('/api/groups/:id/withdraw-requests', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+
+  const [[membership]] = await pool.query(
+    'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?',
+    [groupId, req.userId]
+  );
+  if (!membership) return res.status(403).json({ error: 'Not a member' });
+
+  const [rows] = await pool.execute(
+    `SELECT wr.id, wr.requester_id AS requesterId, u.username AS requesterName,
+            wr.amount, wr.reason, wr.status, wr.approvals_needed AS approvalsNeeded,
+            (SELECT COUNT(*) FROM group_withdraw_approvals wa WHERE wa.request_id = wr.id AND wa.decision = 'approve') AS approvalsCount,
+            EXISTS(SELECT 1 FROM group_withdraw_approvals wa WHERE wa.request_id = wr.id AND wa.member_id = ?) AS decidedByMe
+     FROM group_withdraw_requests wr JOIN users u ON u.id = wr.requester_id
+     WHERE wr.group_id = ? AND wr.status = 'pending'
+     ORDER BY wr.created_at DESC`,
+    [req.userId, groupId]
+  );
+  res.json(rows.map((r) => ({ ...r, amount: toCentavos(r.amount) })));
+});
 // ---------- groups (capped at MAX_GROUP_MEMBERS) ----------
 
 app.post('/api/groups', requireAuth, async (req, res) => {
@@ -712,28 +733,94 @@ app.post('/api/groups', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/groups/:id/join', requireAuth, async (req, res) => {
+app.post('/api/groups/:id/request-join', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
+
+  const [[already]] = await pool.query(
+    'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?',
+    [groupId, req.userId]
+  );
+  if (already) return res.status(409).json({ error: 'Already a member' });
+
+  const [[pending]] = await pool.query(
+    "SELECT 1 FROM group_join_requests WHERE group_id = ? AND user_id = ? AND status = 'pending'",
+    [groupId, req.userId]
+  );
+  if (pending) return res.status(409).json({ error: 'Request already pending' });
+
+  await pool.execute(
+    'INSERT INTO group_join_requests (group_id, user_id) VALUES (?, ?)',
+    [groupId, req.userId]
+  );
+  res.json({ ok: true });
+}));
+
+app.get('/api/groups/:id/join-requests', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const [[membership]] = await pool.query(
+    'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?',
+    [groupId, req.userId]
+  );
+  if (!membership) return res.status(403).json({ error: 'Not a member' });
+
+  const [rows] = await pool.execute(
+    `SELECT jr.id, jr.user_id AS userId, u.username, jr.created_at AS createdAt
+     FROM group_join_requests jr JOIN users u ON u.id = jr.user_id
+     WHERE jr.group_id = ? AND jr.status = 'pending'`,
+    [groupId]
+  );
+  res.json(rows);
+});
+
+app.post('/api/groups/:groupId/join-requests/:reqId/respond', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.groupId);
+  const reqId = Number(req.params.reqId);
+  const approve = !!req.body?.approve;
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    // Lock the membership rows for this group so two simultaneous joins
-    // can't both slip past the cap check (the actual race condition #7's
-    // "single device" note doesn't cover, but this one is fixable).
-    const [members] = await conn.query('SELECT user_id FROM group_members WHERE group_id = ? FOR UPDATE', [groupId]);
-    if (members.some((m) => m.user_id === req.userId)) {
+    const [[membership]] = await conn.query(
+      'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?',
+      [groupId, req.userId]
+    );
+    if (!membership) {
       await conn.rollback();
-      return res.status(409).json({ error: 'Already a member of this group' });
-    }
-    if (members.length >= MAX_GROUP_MEMBERS) {
-      await conn.rollback();
-      return res.status(409).json({ error: `This group is full (maximum ${MAX_GROUP_MEMBERS} members)` });
+      return res.status(403).json({ error: 'Not a member of this group' });
     }
 
-    await conn.execute('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', [groupId, req.userId]);
+    const [[request]] = await conn.query(
+      "SELECT * FROM group_join_requests WHERE id = ? AND group_id = ? AND status = 'pending' FOR UPDATE",
+      [reqId, groupId]
+    );
+    if (!request) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Request not found or already decided' });
+    }
+
+    if (approve) {
+      const [members] = await conn.query(
+        'SELECT user_id FROM group_members WHERE group_id = ? FOR UPDATE',
+        [groupId]
+      );
+      if (members.length >= MAX_GROUP_MEMBERS) {
+        await conn.rollback();
+        return res.status(409).json({ error: `Group is full (max ${MAX_GROUP_MEMBERS})` });
+      }
+      await conn.execute(
+        'INSERT INTO group_members (group_id, user_id) VALUES (?, ?)',
+        [groupId, request.user_id]
+      );
+    }
+
+    await conn.execute(
+      'UPDATE group_join_requests SET status = ? WHERE id = ?',
+      [approve ? 'approved' : 'declined', reqId]
+    );
+
     await conn.commit();
-    res.json({ ok: true });
+    res.json({ ok: true, status: approve ? 'approved' : 'declined' });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -742,6 +829,93 @@ app.post('/api/groups/:id/join', requireAuth, async (req, res) => {
   }
 });
 
+app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.groupId);
+  const reqId = Number(req.params.reqId);
+  const approve = !!req.body?.approve;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[membership]] = await conn.query(
+      'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?',
+      [groupId, req.userId]
+    );
+    if (!membership) {
+      await conn.rollback();
+      return res.status(403).json({ error: 'Not a member of this group' });
+    }
+
+    const [[request]] = await conn.query(
+      "SELECT * FROM group_withdraw_requests WHERE id = ? AND group_id = ? AND status = 'pending' FOR UPDATE",
+      [reqId, groupId]
+    );
+    if (!request) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Request not found or already decided' });
+    }
+
+    const [[already]] = await conn.query(
+      'SELECT 1 FROM group_withdraw_approvals WHERE request_id = ? AND member_id = ?',
+      [reqId, req.userId]
+    );
+    if (already) {
+      await conn.rollback();
+      return res.status(409).json({ error: 'You already voted on this request' });
+    }
+
+    await conn.execute(
+      'INSERT INTO group_withdraw_approvals (request_id, member_id, decision) VALUES (?,?,?)',
+      [reqId, req.userId, approve ? 'approve' : 'decline']
+    );
+
+    if (!approve) {
+      await conn.execute("UPDATE group_withdraw_requests SET status = 'declined' WHERE id = ?", [reqId]);
+      await conn.commit();
+      return res.json({ ok: true, status: 'declined' });
+    }
+
+    const [[{ approvals }]] = await conn.query(
+      "SELECT COUNT(*) AS approvals FROM group_withdraw_approvals WHERE request_id = ? AND decision = 'approve'",
+      [reqId]
+    );
+
+    if (approvals >= request.approvals_needed) {
+      const amt = toCentavos(request.amount);
+
+      const [[group]] = await conn.query('SELECT balance FROM `groups` WHERE id = ? FOR UPDATE', [groupId]);
+      if (toCentavos(group.balance) < amt) {
+        await conn.rollback();
+        return res.status(400).json({ error: 'Group balance too low to complete this withdrawal now' });
+      }
+
+      await conn.execute('UPDATE `groups` SET balance = balance - ? WHERE id = ?', [amt, groupId]);
+      await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, request.requester_id]);
+      await conn.execute(
+        'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
+        ['group', groupId, `Withdrawal to user #${request.requester_id} (approved)`, 'Group Withdrawal', amt, 0]
+      );
+      await conn.execute(
+        'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
+        ['user', request.requester_id, `Group withdrawal from #${groupId}`, 'Group Withdrawal', amt, 1]
+      );
+      await conn.execute("UPDATE group_withdraw_requests SET status = 'approved' WHERE id = ?", [reqId]);
+
+      await conn.commit();
+      await refreshUserInIndex(request.requester_id);
+      return res.json({ ok: true, status: 'approved', executed: true });
+    }
+
+    await conn.commit();
+    res.json({ ok: true, status: 'pending', approvalsCount: approvals, approvalsNeeded: request.approvals_needed });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
 
 app.post('/api/groups/:id/contribute', requireAuth, async (req, res) => {
   const groupId = Number(req.params.id);

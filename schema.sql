@@ -47,3 +47,33 @@ SELECT id, name, balance FROM `groups` LIMIT 10;
 SELECT id, amount FROM transactions ORDER BY id DESC LIMIT 10;
 SELECT id, amount FROM withdrawal_requests ORDER BY id DESC LIMIT 10;
 SELECT id, amount, amount_repaid FROM loans ORDER BY id DESC LIMIT 10;
+
+-- ---------- new: group join & withdraw approval tables ----------
+
+CREATE TABLE group_join_requests (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  group_id INT NOT NULL,
+  user_id INT NOT NULL,
+  status ENUM('pending','approved','declined') DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY (group_id, user_id, status)
+);
+
+CREATE TABLE group_withdraw_requests (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  group_id INT NOT NULL,
+  requester_id INT NOT NULL,
+  amount INT NOT NULL,
+  reason VARCHAR(255),
+  status ENUM('pending','approved','declined') DEFAULT 'pending',
+  approvals_needed INT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE group_withdraw_approvals (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  request_id INT NOT NULL,
+  member_id INT NOT NULL,
+  decision ENUM('approve','decline') NOT NULL,
+  UNIQUE KEY (request_id, member_id)
+);
