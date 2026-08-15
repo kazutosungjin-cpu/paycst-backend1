@@ -284,10 +284,14 @@ app.post('/api/login', async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'username and password are required' });
 
-  const [rows] = await pool.execute('SELECT id, password_hash FROM users WHERE username = ?', [username]);
+  const [rows] = await pool.execute('SELECT id, password_hash, status FROM users WHERE username = ?', [username]);
   const user = rows[0];
   const ok = user && (await bcrypt.compare(password, user.password_hash));
   if (!ok) return res.status(401).json({ error: 'Incorrect username or password' });
+
+  if (user.status === 'suspended') {
+    return res.status(403).json({ error: 'This account has been suspended. Contact an administrator.' });
+  }
 
   const pendingToken = sign({ uid: user.id, stage: 'pending', role: 'user' }, '5m');
   res.json({ pendingToken });
@@ -989,7 +993,7 @@ app.post('/api/admin/login', async (req, res) => {
 // how many groups they belong to.
 app.get('/api/admin/users', requireAdmin, async (req, res) => {
   const [users] = await pool.query(
-    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance,
+    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance, u.status,
             (SELECT COUNT(*) FROM group_members gm WHERE gm.user_id = u.id) AS groupCount
      FROM users u`
   );
@@ -1003,6 +1007,22 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
       : mergeSort(normalized, comparators.usernameAsc);
 
   res.json(sorted);
+});
+
+app.post('/api/admin/users/:id/suspend', requireAdmin, async (req, res) => {
+  const userId = Number(req.params.id);
+  const [result] = await pool.execute("UPDATE users SET status = 'suspended' WHERE id = ?", [userId]);
+  if (result.affectedRows === 0) return res.status(404).json({ error: 'User not found' });
+  await refreshUserInIndex(userId);
+  res.json({ ok: true, status: 'suspended' });
+});
+
+app.post('/api/admin/users/:id/reactivate', requireAdmin, async (req, res) => {
+  const userId = Number(req.params.id);
+  const [result] = await pool.execute("UPDATE users SET status = 'active' WHERE id = ?", [userId]);
+  if (result.affectedRows === 0) return res.status(404).json({ error: 'User not found' });
+  await refreshUserInIndex(userId);
+  res.json({ ok: true, status: 'active' });
 });
 
 // Full oversight view: every group with its members and pending requests.
