@@ -1,3 +1,6 @@
 .env
 node_modules/
 npm-debug.log*
+update_pass.sql
+nodeserver.js.backup
+update_admin_pass.sql
