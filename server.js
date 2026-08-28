@@ -87,6 +87,13 @@ process.on('uncaughtException', (err) => {
 
 const app = express();
 
+// Railway (like most hosting platforms) puts the app behind a reverse
+// proxy, so the real client IP arrives via the X-Forwarded-For header
+// rather than the raw socket address. Without this, Express's req.ip
+// (which express-rate-limit keys on) can't be trusted, and rate limiting
+// silently fails to count attempts correctly per visitor.
+app.set('trust proxy', 1);
+
 // ---------- security middleware ----------
 // helmet sets a batch of standard protective HTTP response headers
 // (clickjacking protection, MIME-sniffing prevention, etc.) with sane
