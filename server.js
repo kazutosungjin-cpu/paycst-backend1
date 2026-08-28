@@ -19,7 +19,7 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { mergeSort, comparators } = require('./mergeSort');
 const { Stack } = require('./stack');
 const { Queue } = require('./queue');
@@ -110,12 +110,46 @@ app.use(express.json());
 
 // Rate limiting on the endpoints most worth protecting against
 // brute-force/credential-stuffing. A 4-digit PIN only has 10,000 possible
-// values, so login/verify-pin/register all share one limiter per IP.
+// values.
+//
+// Keyed by USERNAME rather than IP: Railway's multi-hop edge network can
+// present a different X-Forwarded-For chain length per request, which
+// makes req.ip unreliable even with `trust proxy` set — the same client
+// can appear to come from a different "IP" on consecutive requests,
+// silently defeating IP-based limiting. Username is a fixed, real value
+// tied to the account under attack, so it can't be dodged by an attacker
+// rotating source IPs — if anything this is the stronger defense for
+// credential-stuffing specifically. Falls back to req.ip only when no
+// username is present in the body (shouldn't normally happen on these
+// routes, but keeps behavior sane rather than throwing).
+function authKeyGenerator(req) {
+  const username = req.body?.username?.toString().trim().toLowerCase();
+  return username || ipKeyGenerator(req);
+}
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // 10 attempts per IP per window
+  max: 10, // 10 attempts per username per window
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: authKeyGenerator,
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
+// verify-pin doesn't carry a username in its body (it identifies the user
+// via the pendingToken instead), so it needs its own keyGenerator that
+// pulls the uid out of that token — otherwise every pending login in the
+// last 5 minutes would fall back to the same req.ip bucket regardless of
+// which account is actually being verified.
+const pinLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const payload = req.body?.pendingToken && verify(req.body.pendingToken);
+    return payload?.uid ? `pin:${payload.uid}` : ipKeyGenerator(req);
+  },
   message: { error: 'Too many attempts. Please try again later.' },
 });
 
@@ -124,6 +158,7 @@ const adminLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: authKeyGenerator,
   message: { error: 'Too many attempts. Please try again later.' },
 });
 
@@ -339,7 +374,7 @@ app.post('/api/login', authLimiter, asyncRoute(async (req, res) => {
 
 // Step 2: the PIN, checked separately from the password. Only after this
 // succeeds does the client get a token any other endpoint will accept.
-app.post('/api/login/verify-pin', authLimiter, asyncRoute(async (req, res) => {
+app.post('/api/login/verify-pin', pinLimiter, asyncRoute(async (req, res) => {
   const { pendingToken, pin } = req.body || {};
   const payload = pendingToken && verify(pendingToken);
   if (!payload || payload.stage !== 'pending' || payload.role !== 'user') {
