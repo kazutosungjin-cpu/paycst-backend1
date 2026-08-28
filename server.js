@@ -18,6 +18,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { mergeSort, comparators } = require('./mergeSort');
 const { Stack } = require('./stack');
 const { Queue } = require('./queue');
@@ -84,8 +86,39 @@ process.on('uncaughtException', (err) => {
 });
 
 const app = express();
-app.use(cors());
+
+// ---------- security middleware ----------
+// helmet sets a batch of standard protective HTTP response headers
+// (clickjacking protection, MIME-sniffing prevention, etc.) with sane
+// defaults for an API-only server.
+app.use(helmet());
+
+// CORS is restricted to the actual deployed frontend origin — previously
+// wide open (any website could call this API from a visitor's browser).
+app.use(cors({
+  origin: ['https://paycst11.netlify.app'],
+}));
+
 app.use(express.json());
+
+// Rate limiting on the endpoints most worth protecting against
+// brute-force/credential-stuffing. A 4-digit PIN only has 10,000 possible
+// values, so login/verify-pin/register all share one limiter per IP.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // 10 attempts per IP per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again later.' },
+});
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const MAX_GROUP_MEMBERS = 6;
@@ -194,7 +227,11 @@ function verify(token) {
   }
 }
 
-// ADD IT RIGHT HERE:
+// Wraps an async Express route handler so any rejected promise (a thrown
+// error, a failed query, a missing table, etc.) is forwarded to
+// Express's error-handling middleware via next(err) instead of being
+// silently swallowed as an "unhandled rejection" — which previously left
+// the client hanging forever with no response at all.
 function asyncRoute(handler) {
   return (req, res, next) => {
     Promise.resolve(handler(req, res, next)).catch(next);
@@ -231,7 +268,7 @@ function nextWalletId() {
 
 // ---------- registration / login (password, THEN pin) ----------
 
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
   const { username, password, pin, phoneNumber } = req.body || {};
   if (!username || !password || !pin || !phoneNumber) {
     return res.status(400).json({ error: 'username, password, pin, and phoneNumber are required' });
@@ -275,31 +312,27 @@ app.post('/api/register', async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
 // Step 1: password only. Returns a short-lived "pending" token that is
 // NOT enough to call any authenticated endpoint — it only unlocks the
 // pin-verify step below.
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', authLimiter, asyncRoute(async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'username and password are required' });
 
-  const [rows] = await pool.execute('SELECT id, password_hash, status FROM users WHERE username = ?', [username]);
+  const [rows] = await pool.execute('SELECT id, password_hash FROM users WHERE username = ?', [username]);
   const user = rows[0];
   const ok = user && (await bcrypt.compare(password, user.password_hash));
   if (!ok) return res.status(401).json({ error: 'Incorrect username or password' });
 
-  if (user.status === 'suspended') {
-    return res.status(403).json({ error: 'This account has been suspended. Contact an administrator.' });
-  }
-
   const pendingToken = sign({ uid: user.id, stage: 'pending', role: 'user' }, '5m');
   res.json({ pendingToken });
-});
+}));
 
 // Step 2: the PIN, checked separately from the password. Only after this
 // succeeds does the client get a token any other endpoint will accept.
-app.post('/api/login/verify-pin', async (req, res) => {
+app.post('/api/login/verify-pin', authLimiter, asyncRoute(async (req, res) => {
   const { pendingToken, pin } = req.body || {};
   const payload = pendingToken && verify(pendingToken);
   if (!payload || payload.stage !== 'pending' || payload.role !== 'user') {
@@ -320,18 +353,18 @@ app.post('/api/login/verify-pin', async (req, res) => {
     // divides by 100 only when displaying it.
     user: { id: user.id, username: user.username, walletId: user.wallet_id, balance: toCentavos(user.balance) },
   });
-});
+}));
 
-app.get('/api/me', requireAuth, async (req, res) => {
+app.get('/api/me', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute('SELECT id, username, wallet_id, balance FROM users WHERE id = ?', [req.userId]);
   if (!rows[0]) return res.status(404).json({ error: 'User not found' });
   const u = rows[0];
   res.json({ id: u.id, username: u.username, wallet_id: u.wallet_id, balance: toCentavos(u.balance) });
-});
+}));
 
 // ---------- wallet-to-wallet (QR) payment ----------
 
-app.post('/api/wallet/pay', requireAuth, async (req, res) => {
+app.post('/api/wallet/pay', requireAuth, asyncRoute(async (req, res) => {
   const { walletId, amountCentavos } = req.body || {};
   const amt = parseCentavos(amountCentavos);
   if (!walletId || amt === null) {
@@ -392,11 +425,11 @@ app.post('/api/wallet/pay', requireAuth, async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
 // ---------- personal-account actions (restored) ----------
 
-app.get('/api/notifications', requireAuth, async (req, res) => {
+app.get('/api/notifications', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT id, label AS title, type, amount, is_credit AS isCredit, created_at AS createdAt
      FROM transactions
@@ -406,9 +439,9 @@ app.get('/api/notifications', requireAuth, async (req, res) => {
     [req.userId]
   );
   res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
-});
+}));
 
-app.post('/api/send', requireAuth, async (req, res) => {
+app.post('/api/send', requireAuth, asyncRoute(async (req, res) => {
   const recipient = req.body?.recipient?.toString().trim();
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!recipient || amt === null) {
@@ -469,9 +502,9 @@ app.post('/api/send', requireAuth, async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
-app.post('/api/load', requireAuth, async (req, res) => {
+app.post('/api/load', requireAuth, asyncRoute(async (req, res) => {
   const { number, network } = req.body || {};
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!number || !network || amt === null) {
@@ -507,9 +540,9 @@ app.post('/api/load', requireAuth, async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
-app.post('/api/bills/pay', requireAuth, async (req, res) => {
+app.post('/api/bills/pay', requireAuth, asyncRoute(async (req, res) => {
   const biller = req.body?.biller?.toString().trim();
   const amt = parseCentavos(req.body?.amountCentavos);
   if (!biller || amt === null) {
@@ -545,9 +578,9 @@ app.post('/api/bills/pay', requireAuth, async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
-app.get('/api/transactions', requireAuth, async (req, res) => {
+app.get('/api/transactions', requireAuth, asyncRoute(async (req, res) => {
   const [[me]] = await pool.query('SELECT username FROM users WHERE id = ?', [req.userId]);
   const [groupRows] = await pool.execute(
     'SELECT g.id, g.name FROM group_members gm JOIN `groups` g ON g.id = gm.group_id WHERE gm.user_id = ?',
@@ -585,9 +618,9 @@ app.get('/api/transactions', requireAuth, async (req, res) => {
   const sorted = mergeSort(normalized, comparators.dateDesc);
 
   res.json(sorted);
-});
+}));
 
-app.get('/api/groups/mine', requireAuth, async (req, res) => {
+app.get('/api/groups/mine', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT g.id, g.name, g.balance,
             (SELECT COUNT(*) FROM group_members gm2 WHERE gm2.group_id = g.id) AS memberCount
@@ -597,9 +630,9 @@ app.get('/api/groups/mine', requireAuth, async (req, res) => {
     [req.userId]
   );
   res.json(rows.map((g) => ({ ...g, balance: toCentavos(g.balance) })));
-});
+}));
 
-app.get('/api/groups', requireAuth, async (req, res) => {
+app.get('/api/groups', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT g.id, g.name, g.balance,
             (SELECT COUNT(*) FROM group_members gm2 WHERE gm2.group_id = g.id) AS memberCount
@@ -607,9 +640,9 @@ app.get('/api/groups', requireAuth, async (req, res) => {
      ORDER BY g.name ASC`
   );
   res.json(rows.map((g) => ({ ...g, balance: toCentavos(g.balance) })));
-});
+}));
 
-app.get('/api/groups/:id', requireAuth, async (req, res) => {
+app.get('/api/groups/:id', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   if (!Number.isInteger(groupId)) {
     return res.status(400).json({ error: 'Invalid group ID' });
@@ -623,9 +656,9 @@ app.get('/api/groups/:id', requireAuth, async (req, res) => {
     [groupId]
   );
   res.json({ id: group.id, name: group.name, balance: toCentavos(group.balance), members });
-});
+}));
 
-app.get('/api/groups/:id/transactions', requireAuth, async (req, res) => {
+app.get('/api/groups/:id/transactions', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   if (!Number.isInteger(groupId)) {
     return res.status(400).json({ error: 'Invalid group ID' });
@@ -638,9 +671,9 @@ app.get('/api/groups/:id/transactions', requireAuth, async (req, res) => {
     [groupId]
   );
   res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
-});
+}));
 
-app.get('/api/groups/:id/requests', requireAuth, async (req, res) => {
+app.get('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const [rows] = await pool.execute(
     `SELECT id, requester_name AS requesterName, reason, amount, status, created_at AS createdAt
@@ -650,9 +683,9 @@ app.get('/api/groups/:id/requests', requireAuth, async (req, res) => {
     [groupId]
   );
   res.json(rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })));
-});
+}));
 
-app.post('/api/groups/:id/withdraw-requests', requireAuth, async (req, res) => {
+app.post('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   const reason = req.body?.reason?.toString().trim() || null;
@@ -693,9 +726,9 @@ app.post('/api/groups/:id/withdraw-requests', requireAuth, async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
-app.get('/api/groups/:id/withdraw-requests', requireAuth, async (req, res) => {
+app.get('/api/groups/:id/withdraw-requests', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
 
   const [[membership]] = await pool.query(
@@ -715,10 +748,10 @@ app.get('/api/groups/:id/withdraw-requests', requireAuth, async (req, res) => {
     [req.userId, groupId]
   );
   res.json(rows.map((r) => ({ ...r, amount: toCentavos(r.amount) })));
-});
+}));
 // ---------- groups (capped at MAX_GROUP_MEMBERS) ----------
 
-app.post('/api/groups', requireAuth, async (req, res) => {
+app.post('/api/groups', requireAuth, asyncRoute(async (req, res) => {
   const { name } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name is required' });
 
@@ -735,7 +768,7 @@ app.post('/api/groups', requireAuth, async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
 app.post('/api/groups/:id/request-join', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
@@ -759,7 +792,7 @@ app.post('/api/groups/:id/request-join', requireAuth, asyncRoute(async (req, res
   res.json({ ok: true });
 }));
 
-app.get('/api/groups/:id/join-requests', requireAuth, async (req, res) => {
+app.get('/api/groups/:id/join-requests', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const [[membership]] = await pool.query(
     'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?',
@@ -774,9 +807,9 @@ app.get('/api/groups/:id/join-requests', requireAuth, async (req, res) => {
     [groupId]
   );
   res.json(rows);
-});
+}));
 
-app.post('/api/groups/:groupId/join-requests/:reqId/respond', requireAuth, async (req, res) => {
+app.post('/api/groups/:groupId/join-requests/:reqId/respond', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.groupId);
   const reqId = Number(req.params.reqId);
   const approve = !!req.body?.approve;
@@ -831,9 +864,9 @@ app.post('/api/groups/:groupId/join-requests/:reqId/respond', requireAuth, async
   } finally {
     conn.release();
   }
-});
+}));
 
-app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, async (req, res) => {
+app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.groupId);
   const reqId = Number(req.params.reqId);
   const approve = !!req.body?.approve;
@@ -919,9 +952,9 @@ app.post('/api/groups/:groupId/withdraw-requests/:reqId/respond', requireAuth, a
   } finally {
     conn.release();
   }
-});
+}));
 
-app.post('/api/groups/:id/contribute', requireAuth, async (req, res) => {
+app.post('/api/groups/:id/contribute', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
@@ -961,9 +994,9 @@ app.post('/api/groups/:id/contribute', requireAuth, async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
-app.post('/api/groups/:id/requests', requireAuth, async (req, res) => {
+app.post('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const { requesterName, reason, amountCentavos } = req.body || {};
   const amt = parseCentavos(amountCentavos);
@@ -975,11 +1008,11 @@ app.post('/api/groups/:id/requests', requireAuth, async (req, res) => {
     [groupId, requesterName, reason, amt]
   );
   res.json({ ok: true });
-});
+}));
 
 // ---------- admin: login + final say on groups (item #13) ----------
 
-app.post('/api/admin/login', async (req, res) => {
+app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
   const { username, password } = req.body || {};
   const [rows] = await pool.execute('SELECT id, password_hash FROM admins WHERE username = ?', [username]);
   const admin = rows[0];
@@ -987,13 +1020,13 @@ app.post('/api/admin/login', async (req, res) => {
   if (!ok) return res.status(401).json({ error: 'Incorrect admin credentials' });
   const token = sign({ uid: admin.id, role: 'admin' }, '4h');
   res.json({ token });
-});
+}));
 
 // Full oversight view: every registered user, their balance/wallet, and
 // how many groups they belong to.
-app.get('/api/admin/users', requireAdmin, async (req, res) => {
+app.get('/api/admin/users', requireAdmin, asyncRoute(async (req, res) => {
   const [users] = await pool.query(
-    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance, u.status,
+    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance,
             (SELECT COUNT(*) FROM group_members gm WHERE gm.user_id = u.id) AS groupCount
      FROM users u`
   );
@@ -1007,26 +1040,10 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
       : mergeSort(normalized, comparators.usernameAsc);
 
   res.json(sorted);
-});
-
-app.post('/api/admin/users/:id/suspend', requireAdmin, async (req, res) => {
-  const userId = Number(req.params.id);
-  const [result] = await pool.execute("UPDATE users SET status = 'suspended' WHERE id = ?", [userId]);
-  if (result.affectedRows === 0) return res.status(404).json({ error: 'User not found' });
-  await refreshUserInIndex(userId);
-  res.json({ ok: true, status: 'suspended' });
-});
-
-app.post('/api/admin/users/:id/reactivate', requireAdmin, async (req, res) => {
-  const userId = Number(req.params.id);
-  const [result] = await pool.execute("UPDATE users SET status = 'active' WHERE id = ?", [userId]);
-  if (result.affectedRows === 0) return res.status(404).json({ error: 'User not found' });
-  await refreshUserInIndex(userId);
-  res.json({ ok: true, status: 'active' });
-});
+}));
 
 // Full oversight view: every group with its members and pending requests.
-app.get('/api/admin/groups', requireAdmin, async (req, res) => {
+app.get('/api/admin/groups', requireAdmin, asyncRoute(async (req, res) => {
   const [groups] = await pool.query('SELECT id, name, balance FROM `groups`');
   for (const g of groups) {
     g.balance = toCentavos(g.balance);
@@ -1045,10 +1062,10 @@ app.get('/api/admin/groups', requireAdmin, async (req, res) => {
     g.pendingRequests = requests.map((r) => ({ ...r, amount: toCentavos(r.amount) }));
   }
   res.json(groups);
-});
+}));
 
 // Admin removes a member from a group.
-app.delete('/api/admin/groups/:id/members/:userId', requireAdmin, async (req, res) => {
+app.delete('/api/admin/groups/:id/members/:userId', requireAdmin, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   const userId = Number(req.params.userId);
   const [result] = await pool.execute('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', [
@@ -1057,10 +1074,10 @@ app.delete('/api/admin/groups/:id/members/:userId', requireAdmin, async (req, re
   ]);
   if (result.affectedRows === 0) return res.status(404).json({ error: 'That user is not in this group' });
   res.json({ ok: true });
-});
+}));
 
 // Admin is the final decider on a group's withdrawal/support request.
-app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, async (req, res) => {
+app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.groupId);
   const reqId = Number(req.params.reqId);
   const approve = !!req.body?.approve;
@@ -1112,7 +1129,7 @@ app.post('/api/admin/groups/:groupId/requests/:reqId/respond', requireAdmin, asy
   } finally {
     conn.release();
   }
-});
+}));
 
 // ---------- admin transfer reversal ----------
 
@@ -1179,7 +1196,7 @@ async function reverseTransferByRef(conn, transferRef) {
 
   return { ok: true, reversalTransferRef, affectedUserIds };
 }
-app.get('/api/admin/transfers/:transferRef', requireAdmin, async (req, res) => {
+app.get('/api/admin/transfers/:transferRef', requireAdmin, asyncRoute(async (req, res) => {
   const transferRef = req.params.transferRef;
   const [rows] = await pool.execute(
     `SELECT id, account_type AS accountType, account_id AS accountId, label, type, amount, is_credit AS isCredit, transfer_ref AS transferRef, created_at AS createdAt
@@ -1194,9 +1211,9 @@ app.get('/api/admin/transfers/:transferRef', requireAdmin, async (req, res) => {
   }
 
   res.json({ transferRef, entries: rows.map((row) => ({ ...row, amount: toCentavos(row.amount) })) });
-});
+}));
 
-app.post('/api/admin/transfers/:transferRef/reverse', requireAdmin, async (req, res) => {
+app.post('/api/admin/transfers/:transferRef/reverse', requireAdmin, asyncRoute(async (req, res) => {
   const transferRef = req.params.transferRef;
   const conn = await pool.getConnection();
   try {
@@ -1215,8 +1232,8 @@ app.post('/api/admin/transfers/:transferRef/reverse', requireAdmin, async (req, 
   } finally {
     conn.release();
   }
-});
-app.post('/api/undo', requireAuth, async (req, res) => {
+}));
+app.post('/api/undo', requireAuth, asyncRoute(async (req, res) => {
   const stack = getUndoStack(req.userId);
   if (stack.isEmpty()) {
     return res.status(400).json({ error: 'Nothing to undo' });
@@ -1243,7 +1260,7 @@ app.post('/api/undo', requireAuth, async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
 // ---------- loans (multi-admin verified, like a real loan) ----------
 //
@@ -1286,7 +1303,7 @@ function approvalsNeededFor(amountCentavos) {
   return 3;
 }
 
-app.post('/api/loans', requireAuth, async (req, res) => {
+app.post('/api/loans', requireAuth, asyncRoute(async (req, res) => {
   const { loanType, amountCentavos, purpose, termMonths, age, governmentId, legalAck } = req.body || {};
   const amt = parseCentavos(amountCentavos);
   const term = Number(termMonths);
@@ -1343,9 +1360,9 @@ app.post('/api/loans', requireAuth, async (req, res) => {
   loanQueue.enqueue({ loanId: result.insertId, userId: req.userId }); // NEW — item: mandatory "Queue"
 
   res.json({ id: result.insertId, ok: true, approvalsNeeded });
-});
+}));
 
-app.get('/api/loans/mine', requireAuth, async (req, res) => {
+app.get('/api/loans/mine', requireAuth, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT l.id, l.loan_type AS loanType, l.amount, l.purpose, l.term_months AS termMonths, l.status,
             l.applicant_age AS applicantAge, l.government_id AS governmentId,
@@ -1355,9 +1372,9 @@ app.get('/api/loans/mine', requireAuth, async (req, res) => {
     [req.userId]
   );
   res.json(rows.map((l) => ({ ...l, amount: toCentavos(l.amount), amountRepaid: toCentavos(l.amountRepaid) })));
-});
+}));
 
-app.post('/api/loans/:id/repay', requireAuth, async (req, res) => {
+app.post('/api/loans/:id/repay', requireAuth, asyncRoute(async (req, res) => {
   const loanId = Number(req.params.id);
   const amt = parseCentavos(req.body?.amountCentavos);
   if (amt === null) return res.status(400).json({ error: 'A positive repayment amount (integer centavos) is required' });
@@ -1416,12 +1433,12 @@ app.post('/api/loans/:id/repay', requireAuth, async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
 // Admin oversight: every loan with how many approvals it has and needs, and
 // whether THIS admin has already decided on it (so the UI can hide the
 // buttons instead of letting them try to vote twice and get a 409).
-app.get('/api/admin/loans', requireAdmin, async (req, res) => {
+app.get('/api/admin/loans', requireAdmin, asyncRoute(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT l.id, l.loan_type AS loanType, l.amount, l.purpose, l.term_months AS termMonths, l.status,
             l.applicant_age AS applicantAge, l.government_id AS governmentId,
@@ -1434,9 +1451,9 @@ app.get('/api/admin/loans', requireAdmin, async (req, res) => {
     [req.adminId, req.adminId]
   );
   res.json(rows.map((l) => ({ ...l, amount: toCentavos(l.amount), amountRepaid: toCentavos(l.amountRepaid) })));
-});
+}));
 
-app.post('/api/admin/loans/:id/respond', requireAdmin, async (req, res) => {
+app.post('/api/admin/loans/:id/respond', requireAdmin, asyncRoute(async (req, res) => {
   const loanId = Number(req.params.id);
   const approve = !!req.body?.approve;
 
@@ -1521,9 +1538,9 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, async (req, res) => {
   } finally {
     conn.release();
   }
-});
+}));
 
-app.get('/api/admin/loans/queue/next', requireAdmin, async (req, res) => {
+app.get('/api/admin/loans/queue/next', requireAdmin, asyncRoute(async (req, res) => {
   const front = loanQueue.peek();
   if (!front) {
     return res.json({ empty: true });
@@ -1539,12 +1556,7 @@ app.get('/api/admin/loans/queue/next', requireAdmin, async (req, res) => {
   );
 
   res.json({ empty: false, loan: { ...loan, amount: toCentavos(loan.amount) } });
-});
-
-app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({ error: 'Internal server error' });
-});
+}));
 
 app.get('/api/admin/accounts/traverse', requireAdmin, (req, res) => {
   const direction = req.query.direction === 'backward' ? 'backward' : 'forward';
@@ -1582,16 +1594,6 @@ app.get('/api/admin/accounts/avl-search/:walletId', requireAdmin, (req, res) => 
   });
 });
 
-const port = process.env.PORT || 3000;
-Promise.all([
-  loadIndexesFromDatabase(),
-  loadLoanQueueFromDatabase(),
-  loadAccountListFromDatabase(),
-  loadWalletAvlFromDatabase(),
-]).then(() => {
-  app.listen(port, () => console.log(`PayCST backend listening on port ${port}`));
-});
-
 // ---------- provider network simulation (item #4 redesign) ----------
 //
 // This is a SIMULATION only — no real bank/provider API is called. It
@@ -1615,6 +1617,24 @@ app.get('/api/routes/compare', requireAuth, (req, res) => {
   }
 
   res.json({ simulated: true, source, destination, ...result });
+});
+
+// This must be registered AFTER every route above it — Express matches
+// error-handling middleware (4-arg signature) only for errors that occur
+// during/after routes already registered before it in the file.
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+const port = process.env.PORT || 3000;
+Promise.all([
+  loadIndexesFromDatabase(),
+  loadLoanQueueFromDatabase(),
+  loadAccountListFromDatabase(),
+  loadWalletAvlFromDatabase(),
+]).then(() => {
+  app.listen(port, () => console.log(`PayCST backend listening on port ${port}`));
 });
 
 // ---------- DB MIGRATION REQUIRED (item #1) ----------
