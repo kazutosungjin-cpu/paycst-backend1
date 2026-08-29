@@ -308,6 +308,44 @@ function nextWalletId() {
   return `PCST-${n}`;
 }
 
+// ---------- database-backed login lockout ----------
+//
+// Complements (doesn't replace) the in-memory express-rate-limit above.
+// That limiter resets on every restart/redeploy — fine as a first line of
+// defense, but not durable. This is the real enforcement: it persists in
+// MySQL, so a restart can't reset an attacker's attempt count back to
+// zero. Mirrors the "3 attempts then a cooldown" behavior the Flutter
+// UI already implies client-side, except enforced here on the server so
+// it can't be bypassed by calling the API directly (as our own curl
+// testing demonstrated the client-side version could be).
+const MAX_LOGIN_ATTEMPTS = 3;
+const LOCKOUT_MS = 30 * 1000; // 30 seconds
+
+// Returns null if not locked, or the number of seconds remaining if it is.
+async function checkLockout(identifier) {
+  const [[{ count }]] = await pool.query(
+    'SELECT COUNT(*) AS count FROM login_attempts WHERE identifier = ? AND attempted_at > (NOW() - INTERVAL ? SECOND)',
+    [identifier, LOCKOUT_MS / 1000]
+  );
+  if (count < MAX_LOGIN_ATTEMPTS) return null;
+
+  const [[oldest]] = await pool.query(
+    'SELECT attempted_at FROM login_attempts WHERE identifier = ? ORDER BY attempted_at DESC LIMIT 1 OFFSET ?',
+    [identifier, MAX_LOGIN_ATTEMPTS - 1]
+  );
+  const unlockAt = new Date(oldest.attempted_at).getTime() + LOCKOUT_MS;
+  const secondsLeft = Math.max(1, Math.ceil((unlockAt - Date.now()) / 1000));
+  return secondsLeft;
+}
+
+async function recordFailedAttempt(identifier) {
+  await pool.execute('INSERT INTO login_attempts (identifier) VALUES (?)', [identifier]);
+}
+
+async function clearAttempts(identifier) {
+  await pool.execute('DELETE FROM login_attempts WHERE identifier = ?', [identifier]);
+}
+
 // ---------- registration / login (password, THEN pin) ----------
 
 app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
@@ -363,10 +401,20 @@ app.post('/api/login', authLimiter, asyncRoute(async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'username and password are required' });
 
+  const identifier = `login:${username.toString().trim().toLowerCase()}`;
+  const lockedForSeconds = await checkLockout(identifier);
+  if (lockedForSeconds !== null) {
+    return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
+  }
+
   const [rows] = await pool.execute('SELECT id, password_hash FROM users WHERE username = ?', [username]);
   const user = rows[0];
   const ok = user && (await bcrypt.compare(password, user.password_hash));
-  if (!ok) return res.status(401).json({ error: 'Incorrect username or password' });
+  if (!ok) {
+    await recordFailedAttempt(identifier);
+    return res.status(401).json({ error: 'Incorrect username or password' });
+  }
+  await clearAttempts(identifier);
 
   const pendingToken = sign({ uid: user.id, stage: 'pending', role: 'user' }, '5m');
   res.json({ pendingToken });
@@ -381,12 +429,22 @@ app.post('/api/login/verify-pin', pinLimiter, asyncRoute(async (req, res) => {
     return res.status(401).json({ error: 'Login session expired, please log in again' });
   }
 
+  const identifier = `pin:${payload.uid}`;
+  const lockedForSeconds = await checkLockout(identifier);
+  if (lockedForSeconds !== null) {
+    return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
+  }
+
   const [rows] = await pool.execute('SELECT id, username, wallet_id, pin_hash, balance FROM users WHERE id = ?', [
     payload.uid,
   ]);
   const user = rows[0];
   const ok = user && (await bcrypt.compare(pin, user.pin_hash));
-  if (!ok) return res.status(401).json({ error: 'Incorrect PIN' });
+  if (!ok) {
+    await recordFailedAttempt(identifier);
+    return res.status(401).json({ error: 'Incorrect PIN' });
+  }
+  await clearAttempts(identifier);
 
   const token = sign({ uid: user.id, stage: 'full', role: 'user' }, '12h');
   res.json({
@@ -1056,10 +1114,22 @@ app.post('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) =>
 
 app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
   const { username, password } = req.body || {};
+  if (!username) return res.status(400).json({ error: 'username is required' });
+
+  const identifier = `admin:${username.toString().trim().toLowerCase()}`;
+  const lockedForSeconds = await checkLockout(identifier);
+  if (lockedForSeconds !== null) {
+    return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
+  }
+
   const [rows] = await pool.execute('SELECT id, password_hash FROM admins WHERE username = ?', [username]);
   const admin = rows[0];
   const ok = admin && (await bcrypt.compare(password || '', admin.password_hash));
-  if (!ok) return res.status(401).json({ error: 'Incorrect admin credentials' });
+  if (!ok) {
+    await recordFailedAttempt(identifier);
+    return res.status(401).json({ error: 'Incorrect admin credentials' });
+  }
+  await clearAttempts(identifier);
   const token = sign({ uid: admin.id, role: 'admin' }, '4h');
   res.json({ token });
 }));
