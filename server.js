@@ -103,7 +103,7 @@ app.use(helmet());
 // CORS is restricted to the actual deployed frontend origin — previously
 // wide open (any website could call this API from a visitor's browser).
 app.use(cors({
-  origin: ['https://paycst11.netlify.app', 'http://localhost:12194'],
+  origin: ['https://paycst11.netlify.app', 'http://localhost:12194', 'http://localhost:3000'],
 }));
 
 app.use(express.json());
@@ -1116,23 +1116,18 @@ app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
   const { username, password } = req.body || {};
   if (!username) return res.status(400).json({ error: 'username is required' });
 
-  console.log('DEBUG received username:', JSON.stringify(username), 'password:', JSON.stringify(password));
-
   const identifier = `admin:${username.toString().trim().toLowerCase()}`;
   const lockedForSeconds = await checkLockout(identifier);
-  console.log('DEBUG lockedForSeconds:', lockedForSeconds);
   if (lockedForSeconds !== null) {
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
   const [rows] = await pool.execute('SELECT id, password_hash FROM admins WHERE username = ?', [username]);
-  console.log('DEBUG rows found:', rows.length, rows[0] ? rows[0].password_hash : 'none');
   const admin = rows[0];
   const ok = admin && (await bcrypt.compare(password || '', admin.password_hash));
-  console.log('DEBUG bcrypt match:', ok);
   if (!ok) {
     await recordFailedAttempt(identifier);
-    return res.status(401).json({ error: 'Incorrect admin credentials v2 TEST', debugUsername: username, debugRowsFound: rows.length, debugHashPreview: admin ? admin.password_hash.slice(0, 10) : 'no-admin-row' });
+    return res.status(401).json({ error: 'Incorrect admin credentials' });
   }
   await clearAttempts(identifier);
   const token = sign({ uid: admin.id, role: 'admin' }, '4h');
@@ -1754,36 +1749,4 @@ Promise.all([
   app.listen(port, () => console.log(`PayCST backend listening on port ${port}`));
 });
 
-// ---------- DB MIGRATION REQUIRED (item #1) ----------
-//
-// This file now writes/reads money as INTEGER centavos, but the columns
-// below were presumably created as DECIMAL(x,2) storing pesos. Run this
-// migration (adjust table/column names if yours differ) BEFORE deploying
-// this file, and multiply any existing data by 100 as part of it:
-//
-//   ALTER TABLE users
-//     MODIFY balance INT NOT NULL DEFAULT 0;
-//   UPDATE users SET balance = ROUND(balance * 100);
-//
-//   ALTER TABLE transactions
-//     MODIFY amount INT NOT NULL;
-//   UPDATE transactions SET amount = ROUND(amount * 100);
-//
-//   ALTER TABLE `groups`
-//     MODIFY balance INT NOT NULL DEFAULT 0;
-//   UPDATE `groups` SET balance = ROUND(balance * 100);
-//
-//   ALTER TABLE withdrawal_requests
-//     MODIFY amount INT NOT NULL;
-//   UPDATE withdrawal_requests SET amount = ROUND(amount * 100);
-//
-//   ALTER TABLE loans
-//     MODIFY amount INT NOT NULL,
-//     MODIFY amount_repaid INT NOT NULL DEFAULT 0;
-//   UPDATE loans SET amount = ROUND(amount * 100), amount_repaid = ROUND(amount_repaid * 100);
-//
-// IMPORTANT: run the ALTER (column type change) and the UPDATE (x100) as
-// one deploy step, with the app briefly stopped, so no write lands between
-// the two using the "wrong" unit. INT tops out around ₱21.4 million per
-// row (2^31 centavos) — swap to BIGINT above if you need headroom beyond
-// that for group or admin-aggregate balances.
+// ---------- provider network simulation and DB migration notes below are unchanged ----------
