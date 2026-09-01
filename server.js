@@ -1116,15 +1116,20 @@ app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
   const { username, password } = req.body || {};
   if (!username) return res.status(400).json({ error: 'username is required' });
 
+  console.log('DEBUG received username:', JSON.stringify(username), 'password:', JSON.stringify(password));
+
   const identifier = `admin:${username.toString().trim().toLowerCase()}`;
   const lockedForSeconds = await checkLockout(identifier);
+  console.log('DEBUG lockedForSeconds:', lockedForSeconds);
   if (lockedForSeconds !== null) {
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
   const [rows] = await pool.execute('SELECT id, password_hash FROM admins WHERE username = ?', [username]);
+  console.log('DEBUG rows found:', rows.length, rows[0] ? rows[0].password_hash : 'none');
   const admin = rows[0];
   const ok = admin && (await bcrypt.compare(password || '', admin.password_hash));
+  console.log('DEBUG bcrypt match:', ok);
   if (!ok) {
     await recordFailedAttempt(identifier);
     return res.status(401).json({ error: 'Incorrect admin credentials' });
