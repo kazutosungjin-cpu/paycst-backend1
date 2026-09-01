@@ -1132,7 +1132,7 @@ app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
   console.log('DEBUG bcrypt match:', ok);
   if (!ok) {
     await recordFailedAttempt(identifier);
-    return res.status(401).json({ error: 'Incorrect admin credentials' });
+    return res.status(401).json({ error: 'Incorrect admin credentials v2 TEST', debugUsername: username, debugRowsFound: rows.length, debugHashPreview: admin ? admin.password_hash.slice(0, 10) : 'no-admin-row' });
   }
   await clearAttempts(identifier);
   const token = sign({ uid: admin.id, role: 'admin' }, '4h');
